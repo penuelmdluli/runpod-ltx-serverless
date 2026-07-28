@@ -8,14 +8,13 @@ ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 HF_HOME=/models HF_HUB_OFF
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git && \
     rm -rf /var/lib/apt/lists/*
 
+# Let git-diffusers resolve its own transformers/huggingface_hub/accelerate
+# versions (pinning an old huggingface_hub conflicts with diffusers-from-git).
 RUN pip install --no-cache-dir \
       "git+https://github.com/huggingface/diffusers.git" \
-      "transformers==4.49.0" \
-      "accelerate==1.4.0" \
-      "sentencepiece==0.2.0" \
-      "imageio==2.36.1" "imageio-ffmpeg==0.5.1" \
-      "huggingface_hub==0.27.1" \
-      "runpod==1.7.7" "Pillow==11.0.0" "requests==2.32.3"
+      transformers accelerate sentencepiece \
+      imageio imageio-ffmpeg \
+      "runpod==1.7.7" Pillow requests
 
 # Bake the 13B distilled model (validates diffusers<->weights at build time).
 RUN python -c "import torch; from diffusers import LTXConditionPipeline; \
