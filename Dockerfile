@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git && \
 # versions (pinning an old huggingface_hub conflicts with diffusers-from-git).
 RUN pip install --no-cache-dir \
       "git+https://github.com/huggingface/diffusers.git" \
-      transformers accelerate sentencepiece \
+      transformers accelerate sentencepiece tiktoken protobuf \
       imageio imageio-ffmpeg \
       "runpod==1.7.7" Pillow requests
 
