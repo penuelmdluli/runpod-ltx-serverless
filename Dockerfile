@@ -16,11 +16,10 @@ RUN pip install --no-cache-dir \
       imageio imageio-ffmpeg \
       "runpod==1.7.7" Pillow requests
 
-# Bake the 13B distilled model + the spatial upscaler (2-stage max-quality flow).
-RUN python -c "import torch; from diffusers import LTXConditionPipeline; from huggingface_hub import snapshot_download; \
+# Bake the 13B distilled model (validates diffusers<->weights at build time).
+RUN python -c "import torch; from diffusers import LTXConditionPipeline; \
 LTXConditionPipeline.from_pretrained('Lightricks/LTX-Video-0.9.7-distilled', torch_dtype=torch.bfloat16); \
-snapshot_download('Lightricks/ltxv-spatial-upscaler-0.9.7'); \
-print('LTX 0.9.7 + upscaler baked OK')"
+print('LTX 0.9.7 distilled baked OK')"
 
 ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 COPY handler.py /handler.py

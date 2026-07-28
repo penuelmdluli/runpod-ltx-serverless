@@ -1,55 +1,58 @@
-"""RunPod Serverless handler — LTX-Video 0.9.7 13B DISTILLED, MAX QUALITY.
+"""RunPod Serverless handler — LTX-Video 0.9.7 13B DISTILLED (T2V + I2V).
 
-Two-stage spatial-upscaler flow (Lightricks' recommended best path):
-  1) generate at downscaled res  ->  2) latent upscale 2x  ->  3) refine  ->  4) downscale.
-T2V + I2V.
+Input (event["input"]):
+  prompt          (str, required)
+  image           (str, optional) base64 / data-URI / http(s) URL -> Image-to-Video
+  negative_prompt (str)
+  width, height   (int)   default 1216 x 704 (rounded to /32)
+  num_frames      (int)   default 97  (rounded to 8n+1)
+  steps           (int)   default 8   (distilled: 4-10)
+  fps             (int)   default 24
+  seed            (int)   optional
 
-Input (event["input"]): prompt (req), image (opt -> I2V), width/height (target,
-default 1216x704), num_frames (default 97), fps (24), seed.
 Output: { video_base64, mp4_bytes, num_frames, fps, kind, total_seconds } | { error, trace }
 """
 import base64
 import io
 import os
-import tempfile
 import time
 import traceback
+import tempfile
 
 import runpod
 
-MODEL = "Lightricks/LTX-Video-0.9.7-distilled"
-UPSAMPLER = "Lightricks/ltxv-spatial-upscaler-0.9.7"
-_P = {}
+MODEL = os.environ.get("LTX_MODEL", "Lightricks/LTX-Video-0.9.7-distilled")
+MAX_B64 = int(os.environ.get("MAX_B64_BYTES", "18000000"))
+_PIPE = {}
 
 
 def _log(m):
     print(f"[handler] {m}", flush=True)
 
 
-def _pipes():
-    if "pipe" in _P:
-        return _P["pipe"], _P["up"]
+def _get_pipe():
+    if "p" in _PIPE:
+        return _PIPE["p"]
     import torch
-    from diffusers import LTXConditionPipeline, LTXLatentUpsamplePipeline
+    from diffusers import LTXConditionPipeline
     t = time.time()
     pipe = LTXConditionPipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
-    up = LTXLatentUpsamplePipeline.from_pretrained(UPSAMPLER, vae=pipe.vae, torch_dtype=torch.bfloat16)
-    pipe.to("cuda"); up.to("cuda")
+    pipe.enable_model_cpu_offload()          # fit the 13B on a 48GB card
     try:
         pipe.vae.enable_tiling()
     except Exception:
         pass
-    _P["pipe"], _P["up"] = pipe, up
-    _log(f"loaded pipelines in {time.time()-t:.1f}s")
-    return pipe, up
+    _PIPE["p"] = pipe
+    _log(f"loaded LTXConditionPipeline in {time.time()-t:.1f}s")
+    return pipe
 
 
 def _decode_image(field):
     from PIL import Image
-    field = str(field).strip()
+    field = field.strip()
     if field.startswith(("http://", "https://")):
         import requests
-        data = requests.get(field, timeout=120).content
+        data = requests.get(field, timeout=60).content
     else:
         if field.startswith("data:") and "," in field:
             field = field.split(",", 1)[1]
@@ -66,56 +69,60 @@ def handler(event):
         prompt = inp.get("prompt")
         if not prompt or not str(prompt).strip():
             return {"error": "missing required field 'prompt'"}
-        neg = inp.get("negative_prompt", "worst quality, inconsistent motion, blurry, jittery, distorted")
-        ew = int(inp.get("width", 1216)); eh = int(inp.get("height", 704))
+
+        neg = inp.get("negative_prompt",
+                      "worst quality, inconsistent motion, blurry, jittery, distorted")
+        width = int(inp.get("width", 1216))
+        height = int(inp.get("height", 704))
         num_frames = int(inp.get("num_frames", 97))
-        if (num_frames - 1) % 8 != 0:
-            num_frames = ((num_frames - 1) // 8) * 8 + 1
+        steps = int(inp.get("steps", 8))
         fps = int(inp.get("fps", 24))
-        seed = int(inp.get("seed", 0))
+        seed = inp.get("seed", None)
         image_field = inp.get("image")
 
-        pipe, up = _pipes()
-        ratio = pipe.vae_spatial_compression_ratio
+        width -= width % 32
+        height -= height % 32
+        if (num_frames - 1) % 8 != 0:
+            num_frames = ((num_frames - 1) // 8) * 8 + 1
 
-        # stage-1 downscaled resolution (2/3), rounded to VAE-acceptable
-        dw = int(ew * 2 / 3); dh = int(eh * 2 / 3)
-        dw -= dw % ratio; dh -= dh % ratio
+        gen = None
+        if seed is not None:
+            gen = torch.Generator(device="cuda").manual_seed(int(seed))
 
-        conditions = None
+        pipe = _get_pipe()
+        kwargs = dict(
+            prompt=prompt, negative_prompt=neg, width=width, height=height,
+            num_frames=num_frames, num_inference_steps=steps,
+            guidance_scale=1.0,                # distilled -> 1.0
+            decode_timestep=0.05, decode_noise_scale=0.025, image_cond_noise_scale=0.0,
+            generator=gen,
+        )
+
         kind = "t2v"
         if image_field:
             from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
-            img = _decode_image(image_field).resize((dw, dh))
-            conditions = [LTXVideoCondition(video=[img], frame_index=0)]
+            img = _decode_image(image_field).resize((width, height))
+            kwargs["conditions"] = [LTXVideoCondition(video=[img], frame_index=0)]
             kind = "i2v"
 
-        base = dict(prompt=prompt, negative_prompt=neg, num_frames=num_frames,
-                    decode_timestep=0.05, decode_noise_scale=0.025, image_cond_noise_scale=0.0,
-                    guidance_scale=1.0, guidance_rescale=0.7)
-        if conditions:
-            base["conditions"] = conditions
-
-        _log(f"stage1 {kind} {dw}x{dh} frames={num_frames}")
-        latents = pipe(width=dw, height=dh, timesteps=[1000, 993, 987, 981, 975, 909, 725, 0.03],
-                       output_type="latent", generator=torch.Generator().manual_seed(seed), **base).frames
-
-        _log("stage2 upscale 2x")
-        up_latents = up(latents=latents, adain_factor=1.0, output_type="latent").frames
-        uw, uh = dw * 2, dh * 2
-
-        _log(f"stage3 refine {uw}x{uh}")
-        video = pipe(width=uw, height=uh, denoise_strength=0.4, timesteps=[1000, 909, 725, 421, 0],
-                     latents=up_latents, output_type="pil",
-                     generator=torch.Generator().manual_seed(seed), **base).frames[0]
-        video = [f.resize((ew, eh)) for f in video]
+        _log(f"gen {kind} {width}x{height} frames={num_frames} steps={steps}")
+        ti = time.time()
+        frames = pipe(**kwargs).frames[0]
+        _log(f"inference done in {time.time()-ti:.1f}s ({len(frames)} frames)")
 
         out_path = os.path.join(tempfile.gettempdir(), f"out_{int(t0)}.mp4")
-        export_to_video(video, out_path, fps=fps)
+        export_to_video(frames, out_path, fps=fps)
         size = os.path.getsize(out_path)
         with open(out_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
-        return {"video_base64": b64, "mp4_bytes": size, "num_frames": len(video),
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        if len(b64) > MAX_B64:
+            return {"error": f"video base64 {len(b64)} exceeds MAX_B64 {MAX_B64}"}
+
+        return {"video_base64": b64, "mp4_bytes": size, "num_frames": len(frames),
                 "fps": fps, "kind": kind, "total_seconds": round(time.time() - t0, 1)}
     except Exception as e:
         tb = traceback.format_exc()
